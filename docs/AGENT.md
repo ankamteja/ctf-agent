@@ -81,7 +81,7 @@ python scripts/agent.py <challenge_dir> "<task>" [host] [port]
 Env overrides: `CTF_DRIVER`, `CTF_SPECIALIST`, `CTF_SANDBOX_IMG`, `CTF_NUM_CTX`,
 `CTF_MAX_STEPS`, `OLLAMA_HOST`, and the sandbox knobs `CTF_SANDBOX_TIMEOUT`
 (default 120s), `CTF_SANDBOX_MEM` (2g), `CTF_SANDBOX_CPUS` (2), `CTF_OUT_CAP`
-(8000), `CTF_SCRATCH_VOL` (`ctf-scratch`). `host`/`port` are passed to the model
+(8000), `CTF_SCRATCH_VOL` (`ctf-scratch`), and the solve-strategy knobs `CTF_MAX_ATTEMPTS` (3 local tries before escalating), `CTF_TEMP_BASE` (0.3), `CTF_TEMP_STEP` (0.3 added per attempt for diversity), `CTF_ESCALATE` (1; set 0 to stay fully local), `CTF_FRONTIER_MODEL` (`openrouter/stealth/ox-alpha`), `CTF_FRONTIER_URL` (OmniRoute), and `OMNIROUTE_API_KEY` (required for escalation). `host`/`port` are passed to the model
 as context (target hint); no tool consumes them directly yet — recon tools
 (task #6) will.
 
@@ -89,6 +89,39 @@ Persistent scratch: `run_in_sandbox` mounts a named podman volume at `/scratch`
 (read-write) that survives across the per-command `--rm` containers, so the agent
 can compile/download in one step and use it the next. `/work` stays read-only.
 Wipe between unrelated challenges with `podman volume rm ctf-scratch`.
+
+## Solve strategy: best-of-N + frontier escalation
+
+`solve()` is the top-level entry (what `main` calls). It does NOT rely on the
+small models being smart in one shot — it wraps them in a try / verify / escalate
+loop:
+
+1. **Best-of-N local attempts.** Runs `run_attempt()` up to `CTF_MAX_ATTEMPTS`
+   times (default 3). Temperature climbs each try (`0.3, 0.6, 0.9`) so repeated
+   attempts explore different approaches instead of repeating the same dead end.
+2. **Reflection between attempts (cheap, no extra model call).** Each attempt
+   returns a compact summary of the tools/commands it issued. Failed summaries
+   are injected into the next attempt as "already tried, take a DIFFERENT
+   approach," so the models don't loop on the same idea.
+3. **Ground-truth oracle.** The flag regex + decoy rejection is the verifier: an
+   attempt only "succeeds" if it yields a real, non-planted flag. The sandbox
+   provides real execution output, so the loop is checking against reality, not
+   the model's confidence.
+4. **Frontier escalation.** If all local attempts fail (and `CTF_ESCALATE!=0`),
+   `ask_frontier()` sends the challenge listing + everything already tried to a
+   large hosted model via OmniRoute, which returns a concrete exploitation plan.
+   One final `run_attempt()` executes that plan in the sandbox. This is the
+   "hand the hard ones to a bigger brain" path — invoked rarely, so the common
+   case stays local and free.
+
+Design note: `ask_frontier` is orchestrator-only — deliberately NOT one of the
+driver's tools — so the local models can't escalate on a whim; escalation only
+happens after N genuine local failures. The frontier's plan is TRUSTED guidance
+(it is our own escalation model), so it is allowed to direct the next attempt;
+retrieved corpus text is still untrusted and fenced as always.
+
+This is optimization of the *system*, not fine-tuning: no model weights change.
+Capability comes from retries + verification + escalation + (next) RAG few-shot.
 
 ## Known caveats
 

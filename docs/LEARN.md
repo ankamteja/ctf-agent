@@ -209,6 +209,30 @@ check `docs/HANDOFF.md` "Gotchas" for known traps (slow downloads, name clashes)
 
 ---
 
+## 6b. How it copes with "the small models are kind of dumb"
+
+An 8B model often won't solve a challenge on the first try. The program is built
+around that fact instead of pretending otherwise:
+
+- **It tries several times (best-of-N).** Each try uses a slightly higher
+  "temperature" (more randomness), so attempt 2 and 3 explore different ideas
+  rather than repeating attempt 1.
+- **It remembers what failed.** A short note of what each failed try did is fed
+  into the next try — "you already tried X, do something different."
+- **It checks against reality, not vibes.** A try only counts as solved if it
+  produces a real flag (and not a fake one planted in the write-ups). The sandbox
+  runs the actual commands, so success is verified, not guessed.
+- **If it's still stuck, it phones a bigger brain.** After a few failed local
+  tries it *escalates*: it sends the challenge and everything tried to a large
+  cloud model (via OmniRoute), gets back a concrete plan, and then the local
+  agent runs that plan in the sandbox. So the cheap local models do the routine
+  work, and the expensive smart model is only used for the hard part.
+
+Important: none of this is "training" in the machine-learning sense — we never
+change the model's brain. We make the *system around* the model smarter (retry,
+remember, verify, escalate). That's the whole strategy: small models + good
+scaffolding beat small models alone.
+
 ## 7. Glossary (quick lookup)
 
 - **flag** — the secret string that proves you solved a challenge.
