@@ -6,8 +6,12 @@
 perfectblue, gtfobins, payloads, google-ctf) in a chromadb store at
 `~/ctf-agent/store/` (38,699 chunks, bge-m3 + reranker).
 
-**When the user hands you a real CTF challenge to solve (not asking about
-this project itself), query this corpus before/while working it:**
+**Hard trigger, not a suggestion**: before running any exploitation command
+against a real CTF challenge the user hands you, run the retrieve.py query
+below at least once and read its output before touching the target. Skipping
+this under time pressure defeats the entire point (ox-alpha review,
+2026-08-25: "CLAUDE.md is persuasion, not enforcement -- give a hard
+trigger or it'll be skipped").
 
 ```bash
 python3 ~/ctf-agent/scripts/retrieve.py "<specific technique query>" --top 5
