@@ -1,1 +1,0 @@
-flag{baseline_smoke_ok}

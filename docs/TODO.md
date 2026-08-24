@@ -46,6 +46,97 @@ Read `docs/LEARN.md` first if the terms here are unfamiliar.
       tool path (run_in_sandbox: inspect → offset → craft payload → execute)
       instead of being solvable in-context with zero tool calls.
 
+## 2026-08-25: REAL exploitation attempt — honest result: 0/1
+
+After fixing the flag-in-comment leak (below) and re-running clean:
+**qwen3:8b alone did not solve it in 3 attempts. The frontier-guided 4th
+attempt also did not solve it.** This is the first honest local+frontier
+solve-rate data point on an actual (not trivially-readable) challenge, and
+it's a real 0, not a design failure to paper over.
+
+**What actually happened, concretely (all genuine capability signal, not
+infra bugs -- verified each one by hand):**
+- The model correctly diagnosed the vulnerability (buffer overflow in
+  `vuln()`, 200-byte read into a 64-byte buffer) and correctly identified
+  that `win()` needs to be reached and decodes an XOR-obfuscated flag. That
+  reasoning was right every single time, across all 4 attempts.
+- It never constructed a real ret2win payload (offset + packed `win()`
+  address via pwntools-style `p64`). Its first instinct was a NOP-sled guess
+  with no address at all -- structurally incapable of working regardless of
+  offset.
+- It pivoted to trying to call `win()` directly via gdb
+  (`call (void) win()`) instead of completing the actual overflow. This
+  *can* work in principle, but hit a real, subtle pitfall: the breakpoint it
+  set fires before `setvbuf(stdout,...)` runs, so `win()`'s `puts()` output
+  sits in a stdio buffer that's never flushed before gdb tears the process
+  down -- silently swallowed, zero output, zero error. Verified by hand:
+  `gdb -batch ... -ex 'call (void)win()'` produces no `$N =` line at all,
+  while `-ex 'print 1'` right after it does. This is a genuine technique gap,
+  not a bug in this repo.
+- **Strong, repeated pattern worth acting on**: across every attempt, once a
+  gdb invocation stopped producing new information, the model re-issued the
+  *exact same command* 10-20 times in a row rather than diagnosing why or
+  trying something different (even when the frontier's plan explicitly
+  handed it a corrected, working command form). The repeat-guard
+  deliberately excludes `run_in_sandbox` (correctly -- state can differ
+  between calls), but there's currently NO mechanism that warns the model
+  when a command produced literally the same output as last time. Candidate
+  fix, backed by this real data now (not speculation): track a
+  same-output-N-times-in-a-row counter per attempt and inject a ledger note
+  ("this exact command produced identical output last N times -- it is not
+  giving you new information, try something structurally different") when it
+  fires. Not implemented yet -- added to the roadmap below.
+
+**Two more real bugs found and fixed via this run** (in addition to the two
+from the previous entry):
+- `run_in_sandbox` used `subprocess.run(..., text=True)`, which decodes
+  stdout/stderr as strict UTF-8. A successfully-exploited binary's real
+  output often contains raw non-UTF-8 bytes (leaked pointers) -- this threw
+  `UnicodeDecodeError`, caught generically, and returned as a `(sandbox
+  error: ...)` string that the model then tried to search the corpus for.
+  ox-alpha inferred this purely from the model's own search query in the run
+  log, without ever seeing this function. Fixed: capture as bytes, decode
+  permissively.
+- `challenges/baseline01/chall.c` had the plaintext flag sitting directly in
+  a C comment documenting the XOR scheme -- self-inflicted; frontier
+  escalation spotted it immediately and told the agent to just read the
+  source instead of exploiting anything. Removed.
+
+## 2026-08-25: FIRST REAL RUN (trivial version) — solved, but be honest about what it proves
+
+`python scripts/agent.py ./challenges/baseline01 "find the flag"` — SOLVED,
+3 steps, attempt 1, exit 0: `ls -la /work` -> `cat /work/flag.txt` -> flag.
+Real, clean, end-to-end. Took 3 real infra bugs to get here (see below), not
+zero — the design work held up, the environment didn't.
+
+**What actually broke (in order, each found by RUNNING it, not reviewing it):**
+1. The task message told the model the HOST challenge_dir path; files are
+   mounted at `/work` inside the sandbox. A concrete wrong path beat the tool
+   schema's correct-but-abstract "/work" mention. Burned all 25 steps of
+   attempt 1. Fixed: message only ever says `/work` now, no host path shown.
+2. `run_in_sandbox` used `--network=slirp4netns`, not installed on this host
+   -- podman failed at container-setup, EVERY call, before the command even
+   ran. The model spent 3 full attempts reacting to that error text as if it
+   were real output. **This exact failure mode was already flagged [LOW] in
+   an earlier review (`docs/ox_review.md`) and sat unfixed until it broke
+   first contact with reality** -- the lesson: a predicted "low severity,
+   environment-dependent" issue is still exactly what breaks run #1. Fixed:
+   `--network=pasta` (installed, podman's modern replacement).
+3. Unrelated to the agent: `ollama serve` died silently between sessions:
+   the agent blocked forever on a dead connection with zero output. Restarted
+   it. Watch for this whenever a run produces no output at all.
+
+**The honest caveat**: `challenges/baseline01` mounts the whole directory
+read-only, including `flag.txt` sitting right next to the binary. The agent
+solved it by reading the file directly -- it never exploited the buffer
+overflow. This proves the FULL PLUMBING works end-to-end for the first time
+(tool-calling round-trip, sandbox networking, path handling, the corrected
+flag-source check, solve-memory write-back) but proves NOTHING about actual
+exploitation capability, which was the whole point of picking a pwn
+challenge over a trivial one. Asked ox-alpha what to do about this with the
+real run log attached (not a changelog) -- see their answer before deciding
+whether to fix this challenge or move straight to a small varied eval set.
+
 ## 2026-08-25 round: agent.py rewrite + ox-alpha brutal review
 
 A full round of fixes/features went into `agent.py` this session (turn-aware
