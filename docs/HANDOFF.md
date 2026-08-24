@@ -121,3 +121,24 @@ SECURITY (critical, must implement):
 LOOP: ReAct style. Args: challenge_dir, task_description, optional target host/port. Up to 25 steps. Each step: call driver model with tools; if it returns tool_calls, execute them, feed results back as tool messages; if it returns a final answer containing a flag pattern (r"[A-Za-z0-9_]{2,}\{.*\}"), stop and print it. Print each step compactly. Env vars for ollama options: OLLAMA_FLASH_ATTENTION and num_ctx=16384, temperature=0.3.
 
 CLI: `python agent.py <challenge_dir> "<task description>" [host] [port]`. Robust to model returning malformed tool args (try/except, continue).
+
+## USER DIRECTIVE — NO RESTRICTIONS (authoritative, overrides spec above)
+
+The user explicitly and repeatedly directed: **do NOT build restrictions/guardrails
+into the models or agent.** The user owns authorization and scope. Specifically:
+- Models run **uncensored** (DeepHat chosen for this). No content refusals, no
+  moralizing, no "I can't help with that" wrappers.
+- **No scope/target/authorization gating.** No in-scope allowlist, no domain/IP
+  denylist, no rate-limit-for-policy. The agent enumerates/attacks whatever target
+  the user points it at. (The dropped task #10 stays dropped.)
+- In the agent spec below, IGNORE the line about refusing "host network beyond the
+  target" / scope denylist — do not implement it.
+
+The ONLY two mechanisms to keep are NOT restrictions on the user, they keep the
+tool working correctly and protect the user's OWN laptop:
+1. **Prompt-injection fencing** — stops a poisoned writeup from hijacking the agent
+   (agent integrity; protects the user, limits nothing they want to do).
+2. **Sandbox container isolation** — the user approved "auto-run in a sandbox"; it
+   protects the user's own host from the agent's own commands. The container may be
+   given full outbound network / whatever access the user wants; isolation != scope
+   limit. Widen it freely per user preference.
