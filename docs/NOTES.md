@@ -147,3 +147,41 @@ during gpt-oss, resume after).
 Next: finish downloads → scan+ingest full corpus → build the agent loop (ReAct:
 local LLM + {search_writeups, run_in_sandbox}) → end-to-end test incl. a planted-
 injection check to prove the fencing holds.
+
+---
+
+## 8. Model re-decision — research-first (efficiency for 8 GB VRAM)
+
+Correction to §2: initial picks (gpt-oss:20b, qwen3:30b-a3b) were "max capability"
+but NOT efficient on THIS 8 GB box. Research-backed revision:
+
+**Finding: on 8 GB VRAM, a dense 7–8B that lives fully in VRAM beats a 20–30B MoE.**
+- 7–8B Q4_K_M: fits VRAM, **40+ tok/s**, big context, no browser-closing.
+- gpt-oss-20b (MoE) on 8 GB: experts spill to slow RAM (~24.8 GB/s) → **~30 tok/s
+  or worse**, needs Brave closed. Its efficiency edge only appears on cards that
+  hold it fully. → not the daily driver here.
+- DeepHat-V2 / Qwen3-30B: strongest on CTF but 30B = same spill problem. Occasional
+  heavy use only.
+
+**Efficient roster (all fit 8 GB fully, ~40+ tok/s):**
+
+| Model | Ollama tag | ~Q4 size | Best for |
+|---|---|---|---|
+| Qwen3-8B | `qwen3:8b` | 5.2 GB | agent driver — best tool-calling + toggle thinking |
+| DeepHat-V1-7B | `DeepHat/DeepHat-V1-7B` | 4.7 GB | security/exploit specialist, uncensored |
+| Qwen2.5-Coder-7B | `qwen2.5-coder:7b` | 4.7 GB | exploit code, RE, script gen |
+| DeepSeek-R1-distill-8B | `deepseek-r1:8b` | 5.2 GB | hard reasoning (crypto/logic); slow, verbose |
+
+**Plan:** route by CTF category — Qwen3-8B drives the agent + tool loop; hand
+pwn/RE/code to Qwen2.5-Coder or DeepHat; hand crypto/logic to R1-distill. All swap
+in/out of the same 8 GB. gpt-oss-20b kept only as an optional heavyweight.
+
+**Tool-calling caveat (measured by others):** local 7–30B models express less
+capability through tool calls than they hold in knowledge (correct IDOR write-up
+but wrong basket-id in practice). → invest in structured tool prompts / constrained
+decoding in the agent loop; this is where capability is won or lost, not model size.
+
+Sources: StationX Best Local LLM Aug 2026; arXiv 2508.16700 (gpt-oss-20b deploy
+analysis); LocalLLM.in Ollama VRAM guide; Morph Best Ollama Models 2026;
+runaihome DeepSeek-R1 distill VRAM guide; ollama.com/DeepHat; TrustedSec
+offensive-security LLM benchmark; Purpleshift local-LLM pentest benchmark.
