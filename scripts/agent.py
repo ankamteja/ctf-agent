@@ -26,7 +26,7 @@ import requests
 
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DRIVER = os.environ.get("CTF_DRIVER", "qwen3:8b")
-SPECIALIST = os.environ.get("CTF_SPECIALIST", "DeepHat/DeepHat-V1-7B")
+SPECIALIST = os.environ.get("CTF_SPECIALIST", "hf.co/mradermacher/DeepHat-V1-7B-GGUF:Q4_K_M")
 SANDBOX_IMG = os.environ.get("CTF_SANDBOX_IMG", "ctf-sandbox:1")
 NUM_CTX = int(os.environ.get("CTF_NUM_CTX", "16384"))
 MAX_STEPS = int(os.environ.get("CTF_MAX_STEPS", "25"))

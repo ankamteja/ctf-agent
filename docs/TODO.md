@@ -51,13 +51,15 @@ Read `docs/LEARN.md` first if the terms here are unfamiliar.
 
 ## Optional / decisions 🔧
 
-- **DeepHat specialist model — currently SKIPPED, and why.** The download was
-  pulling the 15 GB full-precision version, which (a) won't fit the 8 GB GPU and
-  (b) takes ~6 hours. It's now optional anyway, because the frontier-escalation
-  path already covers hard reasoning. If you want it later, pull a **quantized**
-  version (~4-5 GB, e.g. a `Q4_K_M` GGUF tag) instead of the bare
-  `DeepHat/DeepHat-V1-7B` tag. Until then, the agent runs fine on qwen3 + escalation;
-  `ask_specialist` just returns a clean error if DeepHat is absent.
+- **DeepHat specialist model — downloading (fixed).** DeepHat-V1-7B is a strong
+  uncensored, security-tuned 7B — a good LOCAL specialist for CTF/exploit work.
+  The bare ollama tag `DeepHat/DeepHat-V1-7B` pulls a 15 GB full-precision (F16)
+  copy that will NOT fit the 8 GB GPU, so we switched to a quantized GGUF that
+  fits: `hf.co/mradermacher/DeepHat-V1-7B-GGUF:Q4_K_M` (~4.7 GB). It's pulling in
+  the background now. Note it still can't sit in VRAM at the same time as qwen3
+  (5.2 + 4.7 > 8 GB), so ollama swaps them when `ask_specialist` is called — fine,
+  each runs fast alone. If DeepHat is absent, `ask_specialist` returns a clean
+  error and the agent keeps working on qwen3 + escalation.
 - **Frontier model for escalation** — defaults to `openrouter/stealth/ox-alpha`.
   For a stronger backstop, set `CTF_FRONTIER_MODEL` to a bigger model via
   OmniRoute (needs `OMNIROUTE_API_KEY`). No code change needed.

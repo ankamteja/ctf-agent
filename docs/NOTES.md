@@ -185,3 +185,8 @@ Sources: StationX Best Local LLM Aug 2026; arXiv 2508.16700 (gpt-oss-20b deploy
 analysis); LocalLLM.in Ollama VRAM guide; Morph Best Ollama Models 2026;
 runaihome DeepSeek-R1 distill VRAM guide; ollama.com/DeepHat; TrustedSec
 offensive-security LLM benchmark; Purpleshift local-LLM pentest benchmark.
+
+- **DeepHat ollama tag trap:** the bare `ollama pull DeepHat/DeepHat-V1-7B` pulls a
+  15 GB **F16** model (6h download, won't fit 8 GB VRAM). Use the quantized GGUF
+  instead: `ollama pull hf.co/mradermacher/DeepHat-V1-7B-GGUF:Q4_K_M` (~4.7 GB).
+  mradermacher = trusted quantizer; Q4_K_M = good size/quality for 7B.

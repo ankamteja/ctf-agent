@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 L=~/ctf-agent/logs/models.log
-for tag in "qwen3:8b" "DeepHat/DeepHat-V1-7B"; do
+for tag in "qwen3:8b" "hf.co/mradermacher/DeepHat-V1-7B-GGUF:Q4_K_M"; do
   echo "[$(date +%T)] pull $tag" >> $L
   n=0
   until ollama pull "$tag" >> $L 2>&1; do

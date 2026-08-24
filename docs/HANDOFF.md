@@ -22,9 +22,11 @@ dive. Downloads keep running in the background even after the chat is cleared.
   reranker) cached.
 - IN PROGRESS: corpus download (write-up repos) via
   `scripts/finish_downloads.sh` (idempotent; re-run to continue).
-- OPTIONAL/SKIPPED: DeepHat specialist — its default tag pulls a 15 GB F16 model
-  that won't fit 8 GB VRAM; use a quantized (~Q4) tag if wanted. Not needed —
-  frontier escalation covers hard reasoning.
+- DOWNLOADING: DeepHat specialist as a fittable Q4 GGUF —
+  `hf.co/mradermacher/DeepHat-V1-7B-GGUF:Q4_K_M` (~4.7 GB). The bare
+  `DeepHat/DeepHat-V1-7B` ollama tag is a 15 GB F16 that won't fit 8 GB VRAM;
+  don't use it. `CTF_SPECIALIST` in agent.py already points at the Q4 tag. Still
+  optional — qwen3 + frontier escalation works without it.
 - NEXT: ingest corpus → retrieval test → first end-to-end run → optimization
   (constrained tool-calls + RAG few-shot). Full list: `docs/TODO.md`.
 
