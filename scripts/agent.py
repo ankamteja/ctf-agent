@@ -102,14 +102,50 @@ CATEGORY_KEYWORDS = {
                   "steganography", "carve", "wireshark", "disk image"],
 }
 
-def categorize(task):
-    """Cheap keyword heuristic. Returns one of the CATEGORY_KEYWORDS keys or
-    'misc'. Good enough to pick a few-shot trajectory / gate a forced
-    consult -- not precise enough to trust for anything higher-stakes."""
+def categorize(task, challenge_dir=None):
+    """Classify from challenge ARTIFACTS first, task string as fallback.
+
+    Real bug found via the first exploitation run: 'find the flag' is
+    category-null by construction (every challenge gets asked this) -- the
+    keyword heuristic silently returned 'misc' and the forced pwn/crypto
+    specialist consult never fired, even for an actual pwn binary. The
+    signal lives in what's IN the challenge dir, not in the boilerplate task
+    prompt. Task-string keywords now only break ties / cover cases with no
+    local files (e.g. a bare remote target). [ox-alpha review]"""
+    scores = {c: 0 for c in CATEGORY_KEYWORDS}
+    if challenge_dir and os.path.isdir(challenge_dir):
+        try:
+            names = os.listdir(challenge_dir)
+        except OSError:
+            names = []
+        for name in names:
+            path = os.path.join(challenge_dir, name)
+            low = name.lower()
+            if low.endswith((".pcap", ".pcapng")): scores["forensics"] += 3
+            elif low.endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif")): scores["forensics"] += 2
+            elif low.endswith((".sage", ".rsa", ".enc")) or "rsa" in low or "aes" in low: scores["crypto"] += 2
+            elif low.endswith((".apk", ".class", ".jar")): scores["rev"] += 2
+            elif not os.path.isdir(path):
+                try:
+                    with open(path, "rb") as f:
+                        head = f.read(64)
+                except OSError:
+                    head = b""
+                if head[:4] == b"\x7fELF":
+                    # a real binary present is the strongest pwn/rev signal
+                    # available; forced-specialist gating only distinguishes
+                    # pwn from crypto, so default an ELF to pwn.
+                    scores["pwn"] += 3
     t = task.lower()
-    scores = {c: sum(1 for kw in kws if kw in t) for c, kws in CATEGORY_KEYWORDS.items()}
+    for c, kws in CATEGORY_KEYWORDS.items():
+        scores[c] += sum(1 for kw in kws if kw in t)
     best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "misc"
+    result = best if scores[best] > 0 else "misc"
+    if result == "misc" and challenge_dir:
+        print(f"[categorize] no signal from artifacts or task string in "
+              f"{challenge_dir!r} -- defaulted to 'misc' (forced-specialist "
+              f"consult will NOT fire even if this is actually pwn/crypto)")
+    return result
 
 # ----------------------------------------------------------------------------
 # Tool implementations
@@ -752,7 +788,7 @@ def _record_failure(challenge_dir, task, category, notes, frontier_hint=None,
 def solve(challenge_dir, task, host=None, port=None):
     """Best-of-N local attempts (with early escalation on stall), then the
     frontier model, then one final local attempt guided by its plan."""
-    category = categorize(task)
+    category = categorize(task, challenge_dir)
     print(f"[solve] category={category}")
     notes = []
     transcripts = []
