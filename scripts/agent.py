@@ -321,7 +321,7 @@ def run_attempt(challenge_dir, task, host, port, attempt_no, temperature,
         flag = _accept_flag(content, seen_tool_text, step)
         if flag:
             print(f"\n=== FLAG (attempt {attempt_no}) ===\n{flag}")
-            return flag, f"attempt {attempt_no}: SOLVED"
+            return flag, f"attempt {attempt_no}: SOLVED via [{', '.join(tried[:12]) or 'direct answer'}]"
         if step == MAX_STEPS:
             break
     last = (content.strip().replace("\n"," ")[:180]) if content else ""
@@ -371,6 +371,31 @@ def _challenge_snapshot(challenge_dir):
         return f"(snapshot error: {e})"
 
 
+import time as _time, re as _re
+
+SOLVED_DIR = os.environ.get("CTF_SOLVED_DIR",
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "..", "corpus", "solved"))
+
+def _record_solution(challenge_dir, task, flag, how, source):
+    """Write a solved challenge back into the corpus as a trusted exemplar.
+    This is the compounding loop: each solve becomes retrievable few-shot fuel
+    for the next challenge. Ingest picks these up like any other corpus file."""
+    try:
+        os.makedirs(SOLVED_DIR, exist_ok=True)
+        slug = _re.sub(r"[^a-z0-9]+", "-", task.lower())[:40].strip("-") or "chal"
+        fn = os.path.join(SOLVED_DIR, f"{int(_time.time())}_{slug}.md")
+        with open(fn, "w") as f:
+            f.write(f"# Solved: {task}\n\n"
+                    f"- challenge_dir: {challenge_dir}\n"
+                    f"- solved_by: {source}\n"
+                    f"- flag: {flag}\n\n"
+                    f"## Winning approach\n\n{how}\n")
+        print(f"[memory] recorded solution -> {fn}")
+    except Exception as e:
+        print(f"[memory] could not record solution: {e}")
+
+
 def solve(challenge_dir, task, host=None, port=None):
     """Best-of-N local attempts, then escalate to the frontier model, then one
     final local attempt guided by the frontier's plan."""
@@ -381,6 +406,7 @@ def solve(challenge_dir, task, host=None, port=None):
                                     prior_notes=notes)
         if flag:
             print(f"\n[solved locally on attempt {a}]")
+            _record_solution(challenge_dir, task, flag, summary, f"local (attempt {a})")
             return flag
         notes.append(summary)
 
@@ -406,6 +432,8 @@ def solve(challenge_dir, task, host=None, port=None):
                           MAX_ATTEMPTS + 1, TEMP_BASE, frontier_hint=hint)
     if flag:
         print(f"\n[solved with frontier guidance]")
+        _record_solution(challenge_dir, task, flag,
+                         f"Frontier plan:\n{hint}\n\nExecution: {_}", "frontier-guided")
         return flag
     print("\n(no flag after escalation)")
     print("Frontier's full plan is above — you can run it manually.")

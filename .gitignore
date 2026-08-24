@@ -18,3 +18,4 @@ __pycache__/
 # scratch
 tmp/
 *.tmp
+corpus/solved/

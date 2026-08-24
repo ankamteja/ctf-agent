@@ -92,6 +92,12 @@ Wipe between unrelated challenges with `podman volume rm ctf-scratch`.
 
 ## Solve strategy: best-of-N + frontier escalation
 
+Compounding loop: on any solve, `_record_solution()` writes the challenge +
+winning approach + flag to `corpus/solved/` as a trusted exemplar. Re-ingest
+and future retrieval can few-shot from past solves — the system improves with
+use. Roadmap + open gaps: `docs/TODO.md`.
+
+
 `solve()` is the top-level entry (what `main` calls). It does NOT rely on the
 small models being smart in one shot — it wraps them in a try / verify / escalate
 loop:

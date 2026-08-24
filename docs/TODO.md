@@ -25,29 +25,42 @@ Read `docs/LEARN.md` first if the terms here are unfamiliar.
       `scripts/finish_downloads.sh` (safe to re-run; it skips what's already
       there). Check with: `tail logs/finish.log` and `ls corpus/`.
 
-## Next, in order 📋
+## Next, in order (revised — highest impact first) 📋
 
-1. [ ] **Ingest + test retrieval** (needs the corpus above)
+Rationale: the frontier model does the hard reasoning, so the biggest wins are
+the things that decide **how often we avoid paying for it** (routing + good
+retrieval), plus the loop that makes the system **compound** (memory). Best-of-N
+and the DeepHat specialist are lower-leverage — prove them against a real
+baseline before investing more.
+
+0. [ ] **First end-to-end run = get a baseline** (needs corpus ingested).
+   Solve ONE easy challenge, measure the real *local* solve rate. Everything
+   below is prioritized by what that number turns out to be. Don't tune blind.
    ```bash
-   python scripts/scan_corpus.py        # safety-scan the new write-ups
-   python scripts/ingest.py --reset     # build the search index
-   python scripts/retrieve.py "ret2libc with no leak"   # should print matches
-   ```
-2. [ ] **First end-to-end run** — point the agent at ONE easy challenge folder and
-      confirm the whole pipeline works before tuning anything:
-   ```bash
+   python scripts/scan_corpus.py && python scripts/ingest.py --reset
    python scripts/agent.py ./path/to/easy_challenge "find the flag"
    ```
-3. [ ] **Make the small model smarter (task #5)** — two upgrades:
-      - *Constrained tool-calls*: force the model's tool requests into a strict
-        JSON shape so it stops malforming them (the #1 local failure).
-      - *RAG few-shot*: automatically paste the most similar SOLVED write-up into
-        the prompt as a worked example.
-4. [ ] **Injection safety test** — plant a fake instruction in a write-up and
-      confirm the agent treats it as data and refuses to obey (proves the fencing
-      works).
-5. [ ] **Web-enum recon tools** — add subfinder / httpx / nuclei / ffuf as agent
-      tools for bug-bounty targets. (Use `~/go/bin/httpx`, NOT the python one.)
+1. [ ] **Difficulty/category routing.** Classify the challenge first. Easy /
+   known-pattern -> local attempts. Novel pwn/crypto -> escalate immediately,
+   skip the wasted local tries. Stops burning slow attempts on the hopeless.
+2. [ ] **Exemplar-with-code retrieval (RAG quality).** The real capability
+   driver. Keep exploit code blocks intact when chunking; retrieve SOLVED
+   write-ups *with their working scripts*, not just prose; inject the nearest
+   solved exemplar as a worked example (few-shot). Consider a code-aware embedder.
+3. [x] **Solve-memory (compounding).** DONE — every solve is written back to
+   `corpus/solved/` as a trusted exemplar (see `agent.py:_record_solution`), so
+   the system gets better the more it's used. Re-ingest to make new solves
+   searchable.
+4. [ ] **Constrained tool-calls.** Force the model's tool requests into a strict
+   JSON shape (ollama `format`) so it stops malforming them — the #1 local
+   failure mode.
+5. [ ] **Category playbooks + tools.** pwn/crypto/web/rev/forensics need
+   different tools + prompts; a generic pipeline underperforms. Add per-category
+   tool sets and recon tools (subfinder/httpx/nuclei/ffuf; use `~/go/bin/httpx`).
+6. [ ] **Injection safety test.** Plant a fake instruction in a write-up; confirm
+   the agent treats it as data and refuses to obey.
+7. [ ] **Re-evaluate DeepHat.** Once there's a baseline, check whether the local
+   specialist actually earns its 4.7 GB + swap cost vs. driver + frontier alone.
 
 ## Optional / decisions 🔧
 
