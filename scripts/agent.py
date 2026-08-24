@@ -154,9 +154,17 @@ def run_in_sandbox(command):
         SANDBOX_IMG, "bash", "-lc", command,
     ]
     try:
-        p = subprocess.run(argv, capture_output=True, text=True,
-                           timeout=SANDBOX_TIMEOUT)
-        out = (p.stdout or "") + (p.stderr or "")
+        # capture as BYTES, not text=True: an exploited binary's real output
+        # often contains raw non-UTF-8 bytes (leaked pointers, shellcode).
+        # text=True decodes strict-UTF-8 and throws on exactly that, turning
+        # a successful exploit into a crashed tool call -- found via the
+        # first real exploitation attempt, where the model spent steps
+        # confused by "(sandbox error: 'utf-8' codec can't decode byte...)"
+        # instead of ever seeing its own leaked address. [ox-alpha inferred
+        # this purely from the run log, without reading this function]
+        p = subprocess.run(argv, capture_output=True, timeout=SANDBOX_TIMEOUT)
+        out = (p.stdout or b"").decode("utf-8", "replace") + \
+              (p.stderr or b"").decode("utf-8", "replace")
     except subprocess.TimeoutExpired as e:
         pre = (e.stdout or b"")
         if isinstance(pre, bytes): pre = pre.decode("utf-8", "replace")
