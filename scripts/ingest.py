@@ -7,8 +7,13 @@ CORPUS = Path.home()/"ctf-agent"/"corpus"
 STORE  = Path.home()/"ctf-agent"/"store"
 COLL   = "ctf"
 EMB_MODEL = "BAAI/bge-m3"
-EXTS = {".md",".markdown",".txt",".rst",".py",".c",".sh"}
-SKIP_DIRS = {".git","node_modules","assets","images","img",".github"}
+EXTS = {".md",".markdown",".txt",".rst",".py",".c",".sh",
+        ".sage",".asm",".nasm",".S",".rs"}   # widened for google-ctf solve scripts
+SKIP_DIRS = {".git","node_modules","assets","images","img",".github",
+             # google-ctf specific: third_party is 23k vendored files (zero CTF
+             # value), hackceler8 is an ongoing game/infra project (~12k files,
+             # not challenge writeups), infrastructure/.allstar are repo tooling.
+             "third_party","hackceler8","infrastructure",".allstar"}
 MAXBYTES = 400_000   # skip giant files
 CHUNK = 1200         # chars
 OVERLAP = 200
@@ -37,10 +42,16 @@ def main():
     ap.add_argument("--limit",type=int,default=0,help="max files (0=all), for smoke test")
     a=ap.parse_args()
 
-    import chromadb
+    import torch, chromadb
     from sentence_transformers import SentenceTransformer
-    print(f"[ingest] loading {EMB_MODEL} on CPU ...",flush=True)
-    model=SentenceTransformer(EMB_MODEL,device="cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[ingest] loading {EMB_MODEL} on {device} ...",flush=True)
+    model=SentenceTransformer(EMB_MODEL,device=device)
+    model.max_seq_length=512   # CHUNK=1200 chars is ~300-400 tokens; bge-m3 defaults to
+                                # 8192 and pads every chunk to that, which is the actual
+                                # bottleneck (measured: GPU 100% util, ~50min ETA on 3463
+                                # files). 512 covers dense/code chunks with headroom.
+    print(f"[ingest] model loaded successfully",flush=True)
     client=chromadb.PersistentClient(path=str(STORE))
     if a.reset:
         try: client.delete_collection(COLL)
