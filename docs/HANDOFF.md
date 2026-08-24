@@ -3,6 +3,31 @@
 Written 2026-08-24. Read this + `docs/NOTES.md` to resume with zero prior context.
 Repo: private `github.com/ankamteja/ctf-agent`. Project root: `~/ctf-agent`.
 
+## ⭐ RESUME AFTER CLEARING THE CHAT — do this first
+
+Paste this one line to the assistant:
+
+> Read ~/ctf-agent/docs/HANDOFF.md and docs/TODO.md, then tell me the current
+> status and continue the next task.
+
+That's all it needs. `docs/TODO.md` is the live checklist (done / in-progress /
+next). `docs/LEARN.md` is the beginner explainer. `docs/AGENT.md` is the deep
+dive. Downloads keep running in the background even after the chat is cleared.
+
+## Current state (2026-08-24, latest)
+
+- DONE: retrieval stack, sandbox image (`ctf-sandbox:1`), the agent loop
+  (`scripts/agent.py`) with best-of-N + frontier escalation, no model
+  restrictions. Driver model `qwen3:8b` downloaded. Embeddings (`bge-m3` +
+  reranker) cached.
+- IN PROGRESS: corpus download (write-up repos) via
+  `scripts/finish_downloads.sh` (idempotent; re-run to continue).
+- OPTIONAL/SKIPPED: DeepHat specialist — its default tag pulls a 15 GB F16 model
+  that won't fit 8 GB VRAM; use a quantized (~Q4) tag if wanted. Not needed —
+  frontier escalation covers hard reasoning.
+- NEXT: ingest corpus → retrieval test → first end-to-end run → optimization
+  (constrained tool-calls + RAG few-shot). Full list: `docs/TODO.md`.
+
 ## Goal
 
 Local, offline assistant that (a) solves CTF challenges and (b) enumerates
