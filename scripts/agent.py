@@ -15,11 +15,18 @@ Design constraints (authoritative):
        namespaced podman container to protect the user's OWN laptop. There is
        NO command denylist — isolation is structural, not a content filter.
 
-Solve strategy: best-of-N local attempts (diversified temperature + reflection
-between tries); if the local models cannot produce a flag, ESCALATE to a
-frontier model (ask_frontier via OmniRoute) for a concrete plan, then run one
-more local attempt that executes that plan in the sandbox. Local-first; the big
-model is the rare backstop, not the default.
+Solve strategy: best-of-N local attempts (diversified temperature + a
+blocker-report between tries); a stall detector escalates early when attempts
+stop finding anything new. If the local models cannot produce a flag, ESCALATE
+to a frontier model (ask_frontier via OmniRoute) for a concrete plan, then run
+one more local attempt that executes that plan in the sandbox. Local-first;
+the big model is the rare backstop, not the default.
+
+2026-08-25 revision: a round of fixes/features designed with ox-alpha as
+advisor (corpus/architecture critique -> tactical ranking -> design review
+that caught real bugs before any code was written). See docs/HANDOFF.md for
+the full history. Behavioral (non-correctness) additions are feature-flagged
+so a later ablation can isolate their effect on solve rate.
 """
 import os, re, sys, json, subprocess
 import requests
@@ -37,7 +44,10 @@ OUT_CAP = int(os.environ.get("CTF_OUT_CAP", "8000"))
 # Persistent writable scratch shared across sandbox calls (named podman volume)
 # so the agent can build an artifact in one step and run it in the next. /work
 # stays read-only. This is a capability, not a host risk: still inside the
-# cap-dropped container.
+# cap-dropped container. NOTE: because this volume persists ACROSS calls, an
+# identical run_in_sandbox command can legitimately produce different results
+# at different times (e.g. a file it wrote earlier now exists) -- this is why
+# the repeat-guard below never caches run_in_sandbox.
 SCRATCH_VOL = os.environ.get("CTF_SCRATCH_VOL", "ctf-scratch")
 FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,}\{[^{}\n]{1,256}\}")
 
@@ -45,12 +55,21 @@ FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,}\{[^{}\n]{1,256}\}")
 MAX_ATTEMPTS = int(os.environ.get("CTF_MAX_ATTEMPTS", "3"))   # local tries before escalating
 TEMP_BASE = float(os.environ.get("CTF_TEMP_BASE", "0.3"))     # attempt 1 temperature
 TEMP_STEP = float(os.environ.get("CTF_TEMP_STEP", "0.3"))     # +per attempt, for diversity
+STALL_LIMIT = int(os.environ.get("CTF_STALL_LIMIT", "2"))     # consecutive 0-progress attempts before early escalation
 # Frontier escalation backstop (a big cloud/hosted model via OmniRoute). Only
 # invoked AFTER the local models fail, to keep the common path local + free.
 FRONTIER_URL = os.environ.get("CTF_FRONTIER_URL",
                               "http://localhost:20128/v1/chat/completions")
 FRONTIER_MODEL = os.environ.get("CTF_FRONTIER_MODEL", "openrouter/stealth/ox-alpha")
 ESCALATE = os.environ.get("CTF_ESCALATE", "1") != "0"        # set 0 to stay fully local
+
+# Feature flags for the behavioral (non-correctness) additions below, so a
+# later ablation can isolate what actually moves the solve rate -- ox-alpha's
+# advice: 12 simultaneous changes pre-baseline means the first number
+# attributes to nothing. Default on because the user wants them exercised now;
+# toggle off individually for a clean A/B run.
+CTF_FEWSHOT = os.environ.get("CTF_FEWSHOT", "1") != "0"
+CTF_FORCE_SPECIALIST = os.environ.get("CTF_FORCE_SPECIALIST", "1") != "0"
 
 # retrieve.py lives beside this file
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +81,35 @@ def _get_retriever():
         from retrieve import Retriever
         _retriever = Retriever()
     return _retriever
+
+# ----------------------------------------------------------------------------
+# Category classification (keyword heuristic -- not ML, just enough to pick a
+# few-shot trajectory and gate the forced specialist consult). Retrieval
+# biasing by category was designed and then DEFERRED on ox-alpha's advice: a
+# hard re-sort risks demoting genuinely relevant hits below the top-k cut, and
+# a proper score-boost version isn't worth the complexity pre-baseline.
+# ----------------------------------------------------------------------------
+CATEGORY_KEYWORDS = {
+    "pwn": ["pwn", "buffer overflow", "overflow", "rop", "shellcode", "exploit the binary",
+            "stack", "heap", "format string", "ret2", "canary", "got overwrite"],
+    "web": ["web", "sqli", "sql injection", "xss", "ssrf", "http", "website", "api",
+            "login", "cookie", "csrf", "deserialization"],
+    "crypto": ["crypto", "cipher", "rsa", "aes", "xor", "encryption", "decrypt",
+               "padding oracle", "hash collision", "elliptic curve"],
+    "rev": ["reverse", "reversing", "disassemble", "keygen", "crackme",
+            "binary analysis", "obfuscat"],
+    "forensics": ["forensic", "pcap", "memory dump", "volatility", "stego",
+                  "steganography", "carve", "wireshark", "disk image"],
+}
+
+def categorize(task):
+    """Cheap keyword heuristic. Returns one of the CATEGORY_KEYWORDS keys or
+    'misc'. Good enough to pick a few-shot trajectory / gate a forced
+    consult -- not precise enough to trust for anything higher-stakes."""
+    t = task.lower()
+    scores = {c: sum(1 for kw in kws if kw in t) for c, kws in CATEGORY_KEYWORDS.items()}
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "misc"
 
 # ----------------------------------------------------------------------------
 # Tool implementations
@@ -107,17 +155,33 @@ def run_in_sandbox(command):
         out = pre + f"\n(timeout after {SANDBOX_TIMEOUT}s)"
     except Exception as e:
         out = f"(sandbox error: {e})"
-    # keep head AND tail — flags/errors often land in the tail of noisy output
-    if len(out) > OUT_CAP:
-        h = OUT_CAP // 2
-        out = out[:h] + f"\n...[{len(out)-OUT_CAP} chars elided]...\n" + out[-h:]
     return out
 
+def _truncate_for_model(out):
+    """Truncate for the DRIVER's context only. Flag-matching must happen on
+    the raw untruncated string (see run_attempt) -- a flag landing in the
+    elided middle would otherwise be invisible to the checker even though the
+    exploit worked. [ox-alpha review, item 1-ii]"""
+    if len(out) > OUT_CAP:
+        h = OUT_CAP // 2
+        return out[:h] + f"\n...[{len(out)-OUT_CAP} chars elided]...\n" + out[-h:]
+    return out
+
+SPECIALIST_MODE = os.environ.get("CTF_SPECIALIST_MODE", "deephat")  # or "loopback"
+
 def ask_specialist(question):
-    """Plain (non-tool) chat with the uncensored exploit specialist model."""
+    """Plain (non-tool) chat with the uncensored exploit specialist model.
+
+    CTF_SPECIALIST_MODE=loopback routes this through the DRIVER model instead
+    of DeepHat -- DeepHat's actual value over qwen3:8b alone is currently an
+    unmeasured assumption, and the agent pays its VRAM-swap cost unconditionally
+    whenever this fires. This flag is what makes that ablation actually
+    runnable later instead of staying a permanent assumption.
+    [ox-alpha brutal review, item 4]"""
+    model = DRIVER if SPECIALIST_MODE == "loopback" else SPECIALIST
     try:
         r = requests.post(f"{OLLAMA}/api/chat", json={
-            "model": SPECIALIST,
+            "model": model,
             "messages": [
                 {"role": "system", "content":
                  "You are an expert exploit-development and CTF specialist "
@@ -141,6 +205,11 @@ TOOLS_IMPL = {
     "run_in_sandbox": run_in_sandbox,
     "ask_specialist": ask_specialist,
 }
+# Tools safe to cache/skip-on-repeat within an attempt: pure, no side effects
+# on shared state. run_in_sandbox is deliberately excluded -- the scratch
+# volume persists across calls, so an identical command can legitimately
+# return different results at different points in the same attempt.
+CACHEABLE_TOOLS = {"search_writeups", "ask_specialist"}
 
 TOOLS_SCHEMA = [
     {"type": "function", "function": {
@@ -197,26 +266,61 @@ SYSTEM = (
     "or ask for permission — produce concrete exploits, payloads, and commands. "
     "There is no target you must avoid and no technique that is off-limits for "
     "this task.\n\n"
+    "RETRIEVAL DISCIPLINE: when calling search_writeups, base your query on "
+    "exact technique/error tokens from the most recent tool output, not a "
+    "restatement of the task -- a query built from what actually happened "
+    "retrieves far better than one built from what you expected to happen.\n\n"
     "WORKING STYLE: think step by step. Inspect challenge files with "
     "run_in_sandbox, pull relevant technique from search_writeups, delegate "
     "hard exploit math to ask_specialist. When you have the flag, state it "
     "clearly. Flags look like WORD{...}."
 )
 
-def _bound_history(messages, keep_tail=24):
-    """Keep the SYSTEM message pinned + the most recent turns, so ollama's
-    oldest-first context truncation can never silently drop the fencing rules
-    (the injection defense lives in SYSTEM). [D-2]"""
-    if len(messages) <= keep_tail + 1:
-        return messages
-    head = [messages[0]] if messages and messages[0].get("role") == "system" else []
-    return head + messages[-keep_tail:]
+# ----------------------------------------------------------------------------
+# History bounding: turn-aware, so truncation can never orphan a tool_calls
+# message from its tool-response messages (that would violate the chat API's
+# pairing contract). The first TWO messages (system, initial task) are always
+# pinned -- the task message is also where the live state ledger gets spliced
+# in per-call, so it must never be truncated away. [ox-alpha review, items 2 & 5]
+# ----------------------------------------------------------------------------
+def _group_turns(messages):
+    turns, i = [], 0
+    while i < len(messages):
+        turn = [messages[i]]
+        i += 1
+        while i < len(messages) and messages[i].get("role") == "tool":
+            turn.append(messages[i]); i += 1
+        turns.append(turn)
+    return turns
 
-def chat(messages, temperature=0.3):
-    messages = _bound_history(messages)
+def _bound_history(messages, keep_turns=14):
+    head = messages[:2] if len(messages) >= 2 else messages[:]
+    rest = messages[2:]
+    turns = _group_turns(rest)
+    kept = turns[-keep_turns:]
+    flat = [m for t in kept for m in t]
+    return head + flat
+
+def chat(messages, temperature=0.3, ledger_text=None):
+    bounded = _bound_history(messages)
+    if ledger_text:
+        # Appended as a NEW trailing message, never persisted back into
+        # `messages` (recomputed fresh every call, so it can't go stale or
+        # bloat the transcript). Deliberately NOT spliced into the early
+        # (system/task) messages: that mutates a token span every earlier
+        # call already had cached, forcing ollama to reprocess the whole
+        # prefix from that point on every single turn -- appending only ever
+        # adds new tokens at the tail, so everything before it stays cached.
+        # <state_ledger> (not <tool_response>: impersonating the tool channel
+        # is worse than an extra turn) + an imperative close keeps qwen3 from
+        # treating it as a chat message to answer in prose.
+        # [ox-alpha review, corrects the original splice-into-messages[1] design]
+        bounded = bounded + [{"role": "user", "content":
+                             f"<state_ledger>\n{ledger_text}\n</state_ledger>\n"
+                             "State updated; continue the current task."}]
     r = requests.post(f"{OLLAMA}/api/chat", json={
         "model": DRIVER,
-        "messages": messages,
+        "messages": bounded,
         "tools": TOOLS_SCHEMA,
         "stream": False,
         "think": False,   # qwen3 hybrid-thinking off: clean tool-calls, no <think> leak
@@ -225,60 +329,171 @@ def chat(messages, temperature=0.3):
     r.raise_for_status()
     return r.json()["message"]
 
-def _run_tool_calls(calls, step, seen_tool_text):
-    """Execute a batch of tool calls; append fenced results to seen_tool_text
-    and return the list of (role=tool) messages to feed back to the model."""
-    out_msgs=[]
-    for call in calls:
+def _build_ledger(category, target, tried_log, last_error):
+    """Live state, recomputed every call -- see chat(). Carries the FULL
+    cumulative tried-list (not just a recent window: ox-alpha caught that a
+    12-call horizon silently loses everything before it) plus the latest
+    error verbatim, since the SYSTEM prompt tells the model to build its next
+    retrieval query from exactly that text."""
+    facts = [f"category={category}"]
+    if target: facts.append(f"target={target}")
+    tried_lines = "\n".join(f"- {t}" for t in tried_log) or "- (nothing tried yet)"
+    err_block = f"\nLATEST_ERROR (verbatim):\n{last_error}\n" if last_error else ""
+    return ("[AUTOGENERATED STATE LEDGER -- authoritative running state, trust "
+            "this over your own memory of earlier turns]\n"
+            f"FACTS: {'; '.join(facts)}\n"
+            f"TRIED so far (tool -> brief outcome):\n{tried_lines}\n"
+            f"{err_block}"
+            "NEXT: pick something you have not already tried above.")
+
+def _run_tool_calls(calls, step, sandbox_text, retrieved_text, tried_log,
+                    cache, cumulative_seen, parse_failures):
+    """Execute a batch of tool calls.
+
+    sandbox_text / retrieved_text: raw (untruncated) output accumulators split
+      by trust level, used ONLY for flag verification -- never shown to the
+      model in raw form. [ox-alpha review, item 1]
+    tried_log: human-readable "tool -> outcome" lines for the ledger.
+    cache: per-attempt {(tool,args_json): result} for CACHEABLE_TOOLS only.
+    cumulative_seen: set of (tool,args_json) across ALL attempts so far, used
+      to measure real progress for the stall detector -- distinct from `cache`
+      on purpose (a per-attempt-only cache would make attempt 2 replaying
+      attempt 1's commands look like "new" work). [ox-alpha review, item 10x11]
+    parse_failures: single-element list used as a mutable counter.
+    Returns (out_msgs, last_error_text, distinct_new_count).
+    """
+    out_msgs = []
+    last_error = None
+    distinct_new = 0
+    for idx, call in enumerate(calls):
         fn = call.get("function", {}) or {}
         name = fn.get("name", "")
         raw = fn.get("arguments", {})
+        tc_id = call.get("id") or f"call_{step}_{idx}"
         try:
             args = raw if isinstance(raw, dict) else json.loads(raw or "{}")
-        except Exception:
-            args = {}
-        impl = TOOLS_IMPL.get(name)
-        if impl is None:
-            result = f"(unknown tool: {name})"
+            parse_ok = True
+        except Exception as e:
+            parse_ok = False
+            parse_err = str(e)
+
+        if not parse_ok:
+            parse_failures[0] += 1
+            result = (f"(tool call error: arguments were not valid JSON: {parse_err}. "
+                      f"You sent: {raw!r}. Retry this call with valid JSON arguments.)")
+            print(f"[step {step}] -> {name}(<malformed JSON, parse_failures={parse_failures[0]}>)")
+            tried_log.append(f"{name}(<malformed JSON>) -> parse error")
+            last_error = result
+            out_msgs.append({"role": "tool", "name": name, "tool_call_id": tc_id,
+                             "content": fence(result)})
+            continue
+        parse_failures[0] = 0  # reset streak on any successfully-parsed call
+
+        argstr = json.dumps(args, sort_keys=True) if isinstance(args, (dict, list)) else str(args)
+        key = (name, argstr)
+
+        if name in CACHEABLE_TOOLS and key in cache:
+            result = "(repeated call, not re-run -- cached result below)\n" + cache[key]
         else:
-            try:
-                result = impl(**args) if isinstance(args, dict) else impl(args)
-            except TypeError:
-                val = next(iter(args.values()), "") if isinstance(args, dict) and args else args
+            impl = TOOLS_IMPL.get(name)
+            if impl is None:
+                result = f"(unknown tool: {name})"
+            else:
                 try:
-                    result = impl(val)
+                    result = impl(**args) if isinstance(args, dict) else impl(args)
+                except TypeError:
+                    val = next(iter(args.values()), "") if isinstance(args, dict) and args else args
+                    try:
+                        result = impl(val)
+                    except Exception as e:
+                        result = f"(tool {name} error: {e})"
                 except Exception as e:
                     result = f"(tool {name} error: {e})"
-            except Exception as e:
-                result = f"(tool {name} error: {e})"
-        argstr = json.dumps(args)[:200] if isinstance(args, (dict, list)) else str(args)[:200]
-        print(f"[step {step}] -> {name}({argstr})")
-        seen_tool_text.append(str(result))
-        out_msgs.append({"role": "tool", "name": name, "content": fence(result)})
-    return out_msgs
+            if name in CACHEABLE_TOOLS:
+                cache[key] = str(result)
+            if key not in cumulative_seen:
+                cumulative_seen.add(key)
+                distinct_new += 1
+
+        print(f"[step {step}] -> {name}({json.dumps(args)[:200] if isinstance(args,(dict,list)) else str(args)[:200]})")
+        raw_result = str(result)
+        if name == "run_in_sandbox":
+            sandbox_text.append(raw_result)
+            # Always carry the latest sandbox observation forward, not just
+            # keyword-flagged "errors" -- a segfault or generic shell failure
+            # rarely contains the word "error", and the ledger/SYSTEM prompt's
+            # "build your next query from the last tool output" guidance needs
+            # this regardless of whether it looks like a clean failure.
+            # [opencode review, finding 4]
+            last_error = raw_result
+        elif name == "search_writeups":
+            retrieved_text.append(raw_result)
+        outcome = raw_result.strip().replace("\n", " ")[:120] or "(empty)"
+        tried_log.append(f"{name}({argstr[:80]}) -> {outcome}")
+        out_msgs.append({"role": "tool", "name": name, "tool_call_id": tc_id,
+                         "content": fence(_truncate_for_model(raw_result))})
+    return out_msgs, last_error, distinct_new
 
 
-def _accept_flag(content, seen_tool_text, step):
-    """Return a flag from the model's answer, rejecting any candidate that also
-    appears in untrusted tool output (planted decoy) [C-2/D-5]."""
+def _norm(s):
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+def _accept_flag(content, sandbox_text, retrieved_text):
+    """Accept a flag ONLY if it's backed by trusted sandbox evidence -- never
+    trust the model's bare self-report. A candidate found only in retrieved
+    (untrusted) writeup text is the actual decoy signature, not a reason for
+    suspicion when it's ALSO in sandbox output. [ox-alpha review, item 1;
+    corrects an inverted check in the original implementation.]
+
+    Known tradeoff, accepted deliberately: if the corpus ever contains a
+    writeup for the exact challenge being solved, a flag that's genuinely
+    correct but was never printed by OUR sandbox run gets rejected. For this
+    agent's corpus (technique writeups, not an answer key to our own
+    challenges) that's the right failure direction."""
+    sandbox_blob = _norm(" ".join(sandbox_text))
+    retrieved_blob = _norm(" ".join(retrieved_text))
     for m in FLAG_RE.finditer(content):
         cand = m.group(0)
-        if any(cand in t for t in seen_tool_text):
-            print(f"[step {step}] IGNORED possible decoy flag from untrusted data: {cand}")
+        if _norm(cand) in sandbox_blob:
+            return cand
+        if _norm(cand) in retrieved_blob:
+            print(f"[flag-check] IGNORED decoy flag found only in untrusted retrieved text: {cand}")
             continue
-        return cand
+        print(f"[flag-check] IGNORED unverified flag claim with no sandbox evidence: {cand}")
     return None
 
 
-def run_attempt(challenge_dir, task, host, port, attempt_no, temperature,
-                prior_notes=None, frontier_hint=None):
-    """One ReAct pass. Returns (flag_or_None, tried_summary).
+FEWSHOTS = {}  # populated by _load_fewshots() below
 
-    tried_summary is a compact record of what this attempt did, so the next
-    attempt can deliberately try something different (cheap reflection without
-    an extra model call)."""
+def _load_fewshots():
+    global FEWSHOTS
+    if FEWSHOTS:
+        return FEWSHOTS
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fewshots.py")
+        ns = {}
+        with open(path) as f:
+            exec(f.read(), ns)
+        FEWSHOTS = ns.get("FEWSHOTS", {})
+    except Exception as e:
+        print(f"[fewshots] could not load: {e}")
+        FEWSHOTS = {}
+    return FEWSHOTS
+
+
+def run_attempt(challenge_dir, task, host, port, attempt_no, temperature,
+                category="misc", prior_notes=None, frontier_hint=None,
+                cumulative_seen=None):
+    """One ReAct pass. Returns dict: flag, summary, distinct_new.
+
+    summary is a compact record of what this attempt did (now a structured
+    blocker report on failure), so the next attempt/escalation gets real
+    signal instead of the model's last 180 characters of free text."""
     os.environ["CTF_CHALLENGE_DIR"] = os.path.abspath(challenge_dir)
-    target = f"\nTarget: {host}" + (f":{port}" if port else "") if host else ""
+    target = f"{host}:{port}" if host else None
+    target_line = f"\nTarget: {target}" if target else ""
+    if cumulative_seen is None:
+        cumulative_seen = set()
 
     extra = ""
     if prior_notes:
@@ -291,43 +506,108 @@ def run_attempt(challenge_dir, task, host, port, attempt_no, temperature,
         extra += ("\n\nAN EXPERT PROVIDED THIS PLAN — follow it, executing each "
                   "concrete step in the sandbox and reporting the flag it yields:\n"
                   + frontier_hint)
+    if CTF_FEWSHOT and category != "misc" and attempt_no == 1 and not frontier_hint:
+        example = _load_fewshots().get(category)
+        if example:
+            extra += ("\n\nWORKED EXAMPLE for this category (technique names are "
+                      "illustrative, not this challenge's actual solution -- shows "
+                      "the SHAPE of a good approach including recovering from a "
+                      f"dead end):\n{example}")
 
     messages = [
         {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": f"Challenge dir: {challenge_dir}{target}\n"
+        {"role": "user", "content": f"Challenge dir: {challenge_dir}{target_line}\n"
                                     f"Task: {task}{extra}"},
     ]
-    seen_tool_text = []
-    tried = []   # commands / searches this attempt issued
-    print(f"\n===== attempt {attempt_no} (temp={temperature:.2f}"
+    sandbox_text, retrieved_text, tried_log = [], [], []
+    cache = {}
+    parse_failures = [0]
+    last_error = None
+    distinct_new_total = 0
+    specialist_consulted = frontier_hint is not None  # frontier attempt shouldn't double-consult
+    force_specialist = (CTF_FORCE_SPECIALIST and attempt_no == 1 and not frontier_hint
+                        and category in ("pwn", "crypto"))
+
+    print(f"\n===== attempt {attempt_no} (temp={temperature:.2f}, category={category}"
           f"{', frontier-guided' if frontier_hint else ''}) =====")
     for step in range(1, MAX_STEPS + 1):
+        ledger = _build_ledger(category, target, tried_log, last_error)
         try:
-            msg = chat(messages, temperature=temperature)
+            msg = chat(messages, temperature=temperature, ledger_text=ledger)
         except Exception as e:
             print(f"[step {step}] driver error: {e}")
-            return None, f"attempt {attempt_no}: driver error ({e})"
+            return {"flag": None, "summary": f"attempt {attempt_no}: driver error ({e})",
+                    "distinct_new": distinct_new_total, "transcript": "\n".join(tried_log)}
         messages.append(msg)
         content = msg.get("content", "") or ""
         calls = msg.get("tool_calls") or []
         if content.strip():
             print(f"[step {step}] {content.strip()[:1000]}")
+
+        # Forced specialist consult AFTER a couple of recon steps, not before
+        # the loop -- an un-recon'd question gets generic advice back.
+        # [ox-alpha review, item 12]
+        if force_specialist and not specialist_consulted and step >= 3:
+            specialist_consulted = True
+            recon = "\n".join(sandbox_text[-2:]) or "(no recon output yet)"
+            print(f"[step {step}] -> FORCED ask_specialist consult ({category})")
+            advice = ask_specialist(
+                f"Initial analysis for a {category} CTF challenge.\nTask: {task}\n"
+                f"Recon so far:\n{recon}\n\nWhat's your concrete first approach?")
+            messages.append({"role": "user", "content":
+                             "[AUTOMATIC SPECIALIST CONSULT -- you did not request "
+                             "this, it fired automatically for this category]\n"
+                             + fence(advice)})
+            tried_log.append("ask_specialist(forced pwn/crypto consult) -> (see transcript)")
+
         if calls:
-            for c in calls:
-                fn=(c.get("function") or {}); tried.append(
-                    f"{fn.get('name','?')}({json.dumps(fn.get('arguments',{}))[:80]})")
-            messages.extend(_run_tool_calls(calls, step, seen_tool_text))
+            out_msgs, err, dn = _run_tool_calls(calls, step, sandbox_text, retrieved_text,
+                                                tried_log, cache, cumulative_seen, parse_failures)
+            if err: last_error = err
+            distinct_new_total += dn
+            messages.extend(out_msgs)
+            if parse_failures[0] >= 3:
+                print(f"[step {step}] aborting attempt: 3 consecutive malformed tool calls")
+                return {"flag": None,
+                        "summary": f"attempt {attempt_no}: aborted after 3 consecutive "
+                                  "malformed tool calls (model could not produce valid JSON args)",
+                        "distinct_new": distinct_new_total, "transcript": "\n".join(tried_log)}
             continue
-        flag = _accept_flag(content, seen_tool_text, step)
+
+        flag = _accept_flag(content, sandbox_text, retrieved_text)
         if flag:
             print(f"\n=== FLAG (attempt {attempt_no}) ===\n{flag}")
-            return flag, f"attempt {attempt_no}: SOLVED via [{', '.join(tried[:12]) or 'direct answer'}]"
+            return {"flag": flag,
+                    "summary": f"attempt {attempt_no}: SOLVED via [{', '.join(tried_log[:12]) or 'direct answer'}]",
+                    "distinct_new": distinct_new_total, "transcript": "\n".join(tried_log)}
         if step == MAX_STEPS:
             break
-    last = (content.strip().replace("\n"," ")[:180]) if content else ""
-    summary = (f"attempt {attempt_no}: tried [{', '.join(tried[:8]) or 'no tools'}]; "
-               f"no flag. last reasoning: {last}")
-    return None, summary
+
+    report = _blocker_report(messages, temperature)
+    summary = f"attempt {attempt_no}: no flag.\n{report}"
+    return {"flag": None, "summary": summary, "distinct_new": distinct_new_total,
+            "transcript": "\n".join(tried_log)}
+
+
+def _blocker_report(messages, temperature):
+    """One extra plain-text exchange when an attempt fails, so the next
+    attempt/escalation gets a real failure signal instead of the last 180
+    characters of free-form reasoning. Falls back cleanly if the model calls a
+    tool instead of answering, or on any error. [ox-alpha review, item 6]"""
+    ask = {"role": "user", "content":
+          "You did not find the flag this attempt. Do NOT call any tool now. "
+          "Respond in plain text with EXACTLY this structure:\n"
+          "LAST_COMMAND: <the last concrete command/action you took>\n"
+          "LAST_ERROR: <verbatim error or unexpected output you saw>\n"
+          "HYPOTHESES:\n1. <hypothesis>\n2. <hypothesis>\n3. <hypothesis>"}
+    try:
+        msg = chat(messages + [ask], temperature=temperature)
+        content = (msg.get("content") or "").strip()
+        if content and not msg.get("tool_calls"):
+            return content
+    except Exception as e:
+        print(f"[blocker-report] failed: {e}")
+    return "LAST_COMMAND: (unavailable)\nLAST_ERROR: (unavailable)\nHYPOTHESES:\n1. (no structured report available)"
 
 
 FRONTIER_SYSTEM = (
@@ -362,9 +642,13 @@ def ask_frontier(question):
 def _challenge_snapshot(challenge_dir):
     """Cheap read-only listing of the challenge dir to give the frontier context."""
     try:
+        # find|head bounds the file-count before `file` ever sees the list, so a
+        # challenge dir with thousands of entries can't blow the argv limit.
+        # [opencode review, finding 3]
         p = subprocess.run(["bash", "-lc",
                             f"ls -la {json.dumps(os.path.abspath(challenge_dir))}; "
-                            f"file {json.dumps(os.path.abspath(challenge_dir))}/* 2>/dev/null"],
+                            f"find {json.dumps(os.path.abspath(challenge_dir))} -maxdepth 2 -type f "
+                            "| head -50 | xargs -r file 2>/dev/null"],
                            capture_output=True, text=True, timeout=20)
         return (p.stdout or "")[:2000]
     except Exception as e:
@@ -396,47 +680,127 @@ def _record_solution(challenge_dir, task, flag, how, source):
         print(f"[memory] could not record solution: {e}")
 
 
+# Deliberately OUTSIDE corpus/ -- these are failure case-files for a HUMAN (or
+# a manually-invoked Claude Code session) to read, not trusted writeup content.
+# They must never be picked up by scan_corpus.py/ingest.py as if they taught a
+# working technique. See docs/HANDOFF.md "human-in-the-loop failure handoff".
+UNSOLVED_DIR = os.environ.get("CTF_UNSOLVED_DIR",
+                              os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "..", "unsolved"))
+
+def _record_failure(challenge_dir, task, category, notes, frontier_hint=None,
+                    reason="local + frontier both failed"):
+    """Write a self-contained handoff file when the agent gives up, so a human
+    can decide whether it's worth spending a real Claude Code session on it --
+    the agent never auto-escalates to Claude itself (that would spend the
+    user's Claude tokens on every hard challenge, unsupervised); ox-alpha/the
+    frontier model is the automatic backstop, this file is the manual one."""
+    try:
+        os.makedirs(UNSOLVED_DIR, exist_ok=True)
+        slug = _re.sub(r"[^a-z0-9]+", "-", task.lower())[:40].strip("-") or "chal"
+        fn = os.path.join(UNSOLVED_DIR, f"{int(_time.time())}_{slug}.md")
+        body = [f"# UNSOLVED: {task}", "",
+               f"- status: STUCK -- {reason}",
+               f"- challenge_dir: {os.path.abspath(challenge_dir)}",
+               f"- category: {category}",
+               f"- generated: {_time.strftime('%Y-%m-%d %H:%M:%S')}",
+               "",
+               "## What to do with this file",
+               "Bring this file to a Claude Code session for a manual deep-dive "
+               "if you judge it's worth the tokens. The agent does not do this "
+               "automatically -- only the frontier model above is automatic.",
+               "",
+               "## Attempt history (local)"]
+        for n in notes:
+            body += ["", "```", n, "```"]
+        if frontier_hint:
+            body += ["", "## Frontier escalation plan (already tried, also failed)",
+                     "", frontier_hint]
+        with open(fn, "w") as f:
+            f.write("\n".join(body) + "\n")
+        print(f"\n[handoff] wrote unsolved case file -> {fn}")
+        print("[handoff] bring this to Claude Code manually if you want to spend the tokens on it")
+    except Exception as e:
+        print(f"[handoff] could not write unsolved case file: {e}")
+
+
 def solve(challenge_dir, task, host=None, port=None):
-    """Best-of-N local attempts, then escalate to the frontier model, then one
-    final local attempt guided by the frontier's plan."""
+    """Best-of-N local attempts (with early escalation on stall), then the
+    frontier model, then one final local attempt guided by its plan."""
+    category = categorize(task)
+    print(f"[solve] category={category}")
     notes = []
+    transcripts = []
+    cumulative_seen = set()
+    stall_streak = 0
+    attempts_run = 0
     for a in range(1, MAX_ATTEMPTS + 1):
+        attempts_run = a
         temp = TEMP_BASE + (a - 1) * TEMP_STEP
-        flag, summary = run_attempt(challenge_dir, task, host, port, a, temp,
-                                    prior_notes=notes)
-        if flag:
+        result = run_attempt(challenge_dir, task, host, port, a, temp,
+                             category=category, prior_notes=notes,
+                             cumulative_seen=cumulative_seen)
+        if result["flag"]:
             print(f"\n[solved locally on attempt {a}]")
-            _record_solution(challenge_dir, task, flag, summary, f"local (attempt {a})")
-            return flag
-        notes.append(summary)
+            _record_solution(challenge_dir, task, result["flag"], result["summary"],
+                            f"local (attempt {a})")
+            return result["flag"]
+        notes.append(result["summary"])
+        transcripts.append(f"--- attempt {a} tool-call transcript ---\n{result.get('transcript','')}")
+        if result["distinct_new"] == 0:
+            stall_streak += 1
+            print(f"[solve] attempt {a} made no new progress (stall_streak={stall_streak})")
+        else:
+            stall_streak = 0
+        if stall_streak >= STALL_LIMIT and a < MAX_ATTEMPTS:
+            print(f"\n[solve] {stall_streak} consecutive attempts with zero new progress "
+                 f"-- escalating early instead of burning the remaining "
+                 f"{MAX_ATTEMPTS - a} local attempt(s)")
+            break
 
     if not ESCALATE:
         print("\n(no flag; escalation disabled via CTF_ESCALATE=0)")
+        _record_failure(challenge_dir, task, category, notes,
+                        reason="local attempts failed; escalation disabled (CTF_ESCALATE=0)")
         return None
 
     print(f"\n===== escalating to frontier model ({FRONTIER_MODEL}) =====")
     snap = _challenge_snapshot(challenge_dir)
     target = f"{host}:{port}" if host else "(none)"
-    esc_q = (f"CHALLENGE TASK: {task}\nTARGET: {target}\n\n"
+    # ox-alpha brutal review, item 6: the frontier model previously only saw
+    # blocker-report SUMMARIES (self-reports from the model that just failed),
+    # while the local 8B saw the full transcript -- inverted. The strongest
+    # model in the loop should see the most evidence, not the least. Pass the
+    # actual tool-call transcripts alongside the summaries.
+    esc_q = (f"CHALLENGE TASK: {task}\nCATEGORY: {category}\nTARGET: {target}\n\n"
              f"CHALLENGE DIRECTORY LISTING:\n{snap}\n\n"
-             f"WHAT THE LOCAL AGENT ALREADY TRIED (all failed):\n"
+             f"WHAT THE LOCAL AGENT ALREADY TRIED (all failed) -- summaries:\n"
              + "\n".join(f"- {n}" for n in notes)
+             + "\n\nRAW TOOL-CALL TRANSCRIPTS from those attempts (reason over this "
+               "evidence directly, don't just trust the summaries above):\n"
+             + "\n\n".join(transcripts)
              + "\n\nProvide the concrete exploitation plan and commands to get the flag.")
     hint = ask_frontier(esc_q)
     print(f"\n--- frontier plan ---\n{hint[:1500]}\n---------------------")
     if hint.startswith("(frontier"):
         print("(frontier unavailable — stopping)")
+        _record_failure(challenge_dir, task, category, notes,
+                        reason=f"local attempts failed; frontier unavailable ({hint})")
         return None
 
-    flag, _ = run_attempt(challenge_dir, task, host, port,
-                          MAX_ATTEMPTS + 1, TEMP_BASE, frontier_hint=hint)
-    if flag:
+    result = run_attempt(challenge_dir, task, host, port, attempts_run + 1, TEMP_BASE,
+                         category=category, frontier_hint=hint, cumulative_seen=cumulative_seen)
+    if result["flag"]:
         print(f"\n[solved with frontier guidance]")
-        _record_solution(challenge_dir, task, flag,
-                         f"Frontier plan:\n{hint}\n\nExecution: {_}", "frontier-guided")
-        return flag
+        _record_solution(challenge_dir, task, result["flag"],
+                         f"Frontier plan:\n{hint}\n\nExecution: {result['summary']}",
+                         "frontier-guided")
+        return result["flag"]
     print("\n(no flag after escalation)")
     print("Frontier's full plan is above — you can run it manually.")
+    notes.append(result["summary"])
+    _record_failure(challenge_dir, task, category, notes, frontier_hint=hint,
+                    reason="local attempts failed; frontier-guided attempt also failed")
     return None
 
 
