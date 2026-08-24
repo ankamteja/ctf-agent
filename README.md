@@ -1,5 +1,8 @@
 # ctf-agent
 
+> **New to this, or learning to code? Start with [`docs/LEARN.md`](docs/LEARN.md)** —
+> a from-zero explanation of every concept and file. This README is the short version.
+
 Local, offline CTF assistant that reads writeups and drives exploitation tools in a
 sandbox. Retrieval-augmented over a corpus of public CTF writeups and technique
 references; an agent loop plans with a local LLM and runs pwn tooling inside an
@@ -25,12 +28,13 @@ capability actually comes from, so that is what this builds.
    query ────▶│  retrieve    │   returns chunks fenced as UNTRUSTED data
               └──────┬───────┘
                      ▼
-              ┌──────────────┐   local LLM (gpt-oss:20b / qwen3:30b-a3b via ollama)
-              │  agent loop  │   tools: search_writeups, run_in_sandbox
+              ┌──────────────┐   local LLM: qwen3:8b (driver) + DeepHat-V1-7B
+              │  agent loop  │   tools: search_writeups, run_in_sandbox,
+              │  (agent.py)  │          ask_specialist
               └──────┬───────┘
                      ▼
               ┌──────────────┐   rootless podman: cap-drop ALL, read-only,
-              │  sandbox     │   mem/cpu/pid caps, egress to target only
+              │  sandbox     │   mem/cpu/pid caps, isolated network
               └──────────────┘
 ```
 
@@ -51,8 +55,9 @@ Defense is layered:
    payloads, host-exec directives, conceal+exfil combos). Everything else stays
    retrievable but flagged for extra fencing.
 3. **Sandbox isolation.** Tool execution never touches the host. Rootless podman
-   container, all capabilities dropped, read-only root, resource-capped, network
-   restricted to the challenge target.
+   container, all capabilities dropped, read-only root, resource-capped. Network
+   is isolated for host safety, not to limit targets — the operator owns scope
+   and may widen outbound access freely.
 
 ## Hardware target
 
@@ -68,6 +73,12 @@ scripts/
   scan_corpus.py   corpus security scan → store/scan_manifest.json
   ingest.py        corpus → chromadb (bge-m3 on CPU)
   retrieve.py      hybrid retrieve + rerank, injection-safe assembly
+  agent.py         the ReAct agent loop (driver LLM + 3 tools)
+docs/
+  LEARN.md         beginner-friendly guide (start here)
+  AGENT.md         agent design + security model
+  ox_review.md     external code review + fix disposition
+  HANDOFF.md       resume-from-here + gotchas
 sandbox/
   Containerfile    locked-down pwn image (pwntools, gdb, ROPgadget, ...)
   run.sh           launch one challenge sandbox
@@ -93,13 +104,16 @@ python scripts/retrieve.py "ret2libc with no leak"
 
 # 5. build sandbox image
 podman build -t ctf-sandbox:1 sandbox/
+
+# 6. run the agent on a challenge folder
+python scripts/agent.py ./path/to/challenge "find the flag" [host] [port]
 ```
 
 ## Status
 
-Work in progress. Corpus ingest, retrieval, sandbox, and security scan are in
-place; the agent loop and end-to-end test are being wired as the local models
-finish downloading.
+Work in progress. Corpus ingest, retrieval, sandbox, security scan, and the
+agent loop (`scripts/agent.py`) are in place. Remaining: finish model/corpus
+downloads, then the ingest + retrieval + end-to-end tests. See `docs/HANDOFF.md`.
 
 ## Corpus sources
 
