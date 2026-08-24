@@ -134,9 +134,17 @@ def run_in_sandbox(command):
     the user's OWN host, and never limits which target a command may hit.
     """
     ch_dir = os.environ.get("CTF_CHALLENGE_DIR", os.getcwd())
+    # slirp4netns is not installed on this host; pasta is its modern
+    # replacement and IS present (podman's rootless netns backend either
+    # works). Without a real network mode podman fails at container-setup
+    # time with "could not find slirp4netns" BEFORE running the command --
+    # every run_in_sandbox call was silently erroring on this until caught by
+    # the first real E2E run, which spent 75 steps reacting to that error
+    # text instead of actual output. [found via first real E2E run]
+    net_mode = os.environ.get("CTF_SANDBOX_NETWORK", "pasta")
     argv = [
         "podman", "run", "--rm", "--init",
-        "--network=slirp4netns",
+        f"--network={net_mode}",
         "--memory=%s" % SANDBOX_MEM, "--cpus=%s" % SANDBOX_CPUS,
         "--pids-limit=256",
         "--cap-drop=ALL", "--security-opt", "no-new-privileges",
@@ -516,7 +524,16 @@ def run_attempt(challenge_dir, task, host, port, attempt_no, temperature,
 
     messages = [
         {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": f"Challenge dir: {challenge_dir}{target_line}\n"
+        # Deliberately do NOT show the model the HOST challenge_dir path --
+        # run #1 this session burned all 25 steps because the model used that
+        # literal host path inside run_in_sandbox (where it doesn't exist;
+        # files are mounted at /work) instead of the tool description's
+        # abstract "/work" mention. A concrete wrong path beat an abstract
+        # correct one. Telling it only the concrete, correct, sandbox-relative
+        # path removes the conflict entirely. [found via first real E2E run]
+        {"role": "user", "content": f"Challenge files are already mounted read-only "
+                                    f"at /work inside the sandbox -- start with "
+                                    f"`ls -la /work` in run_in_sandbox.{target_line}\n"
                                     f"Task: {task}{extra}"},
     ]
     sandbox_text, retrieved_text, tried_log = [], [], []

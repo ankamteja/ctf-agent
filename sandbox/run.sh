@@ -6,7 +6,7 @@ CH="${1:?challenge dir}"; HOST="${2:-}"; PORT="${3:-}"
 IMG=ctf-sandbox:1
 podman run --rm -it \
   --name ctf-work-$$ \
-  --network=slirp4netns \
+  --network=pasta \
   --memory=2g --cpus=2 --pids-limit=256 \
   --cap-drop=ALL --security-opt no-new-privileges \
   --read-only --tmpfs /tmp:rw,size=512m \
