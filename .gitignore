@@ -1,0 +1,20 @@
+# corpus: third-party repos, huge, own licenses — not redistributed
+corpus/
+# vector store + scan manifest (regenerated)
+store/
+# local model artifacts
+models/
+*.gguf
+*.safetensors
+*.bin
+# logs / runtime
+logs/
+*.log
+*.incomplete
+# python
+__pycache__/
+*.pyc
+.venv/
+# scratch
+tmp/
+*.tmp

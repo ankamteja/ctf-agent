@@ -1,0 +1,12 @@
+# Isolated pwn sandbox. Agent runs commands HERE, never on host.
+FROM docker.io/library/debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-dev gcc gdb file binutils \
+      netcat-openbsd curl socat ltrace strace ca-certificates && \
+    pip3 install --no-cache-dir --break-system-packages \
+      pwntools ROPgadget && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 ctf
+USER ctf
+WORKDIR /work
+CMD ["/bin/bash"]
