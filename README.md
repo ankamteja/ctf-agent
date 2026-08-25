@@ -1,8 +1,5 @@
 # ctf-agent
 
-> **New to this, or learning to code? Start with [`docs/LEARN.md`](docs/LEARN.md)** —
-> a from-zero explanation of every concept and file. This README is the short version.
-
 Local, offline CTF assistant that reads writeups and drives exploitation tools in a
 sandbox. Retrieval-augmented over a corpus of public CTF writeups and technique
 references; an agent loop plans with a local LLM and runs pwn tooling inside an
@@ -79,12 +76,8 @@ scripts/
                    actually gets you today
   teacher.py       offline study tool: explains a technique via the corpus
                    + local model, does not attempt to solve anything
-docs/
-  LEARN.md         beginner-friendly guide (start here)
-  AGENT.md         agent design + security model
-  ox_review.md     external code review + fix disposition
-  HANDOFF.md       full session history + honest results, read this for the
-                   real state of things
+docs/              (gitignored) working notes -- design history, session logs,
+                   detailed review threads; not part of the public repo
 corpus/            (gitignored) cloned public writeup repos: hacktricks,
                    p4-ctf, perfectblue, gtfobins, payloads, google-ctf
 store/             (gitignored) chromadb + scan manifest
@@ -137,9 +130,11 @@ plan; local execution of that plan can still fail for the same reason.
 
 This isn't a bug to be fixed away — it's the honest capability ceiling of a
 free/offline 8B model doing autonomous multi-step exploitation, discovered
-by actually running it, not assumed. Full account, including every
-mechanical bug found along the way (sandbox networking, output encoding,
-a category-classifier gap): `docs/HANDOFF.md`.
+by actually running it, not assumed: it correctly diagnoses the
+vulnerability every time and reliably fails to execute/adapt (repeated
+identical failing commands under no new information is the dominant pattern,
+observed across four separate runs including one where a frontier model's
+own corrected plan still failed in local execution).
 
 Given that, `teacher.py` is the more reliable thing to reach for today:
 explaining a technique clearly is well within an 8B model's ability, even

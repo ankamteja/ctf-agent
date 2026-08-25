@@ -20,3 +20,6 @@ tmp/
 *.tmp
 corpus/solved/
 unsolved/
+# working/internal docs -- resume notes, raw ox-alpha reviews, session logs.
+# README.md stays tracked as the public-facing doc.
+docs/
