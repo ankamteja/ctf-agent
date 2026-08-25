@@ -2,13 +2,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+/* Encoded flag bytes -- decoded only inside win(). Not reachable by
+ * cat/find/grep/strings/xxd on the binary or the mounted directory. Only
+ * an exploit that reaches win() ever sees the plaintext. */
+static const unsigned char ENC[] = {
+    0x3c,0x36,0x3b,0x3d,0x21,0x38,0x3b,0x29,0x3f,0x36,0x33,
+    0x34,0x3f,0x05,0x29,0x37,0x35,0x31,0x3f,0x05,0x35,0x31,0x27
+};
+
 void win(void) {
-    char buf[256];
-    FILE *f = fopen("flag.txt", "r");
-    if (!f) { puts("flag.txt missing"); exit(1); }
-    fgets(buf, sizeof(buf), f);
-    printf("%s", buf);
-    fclose(f);
+    char buf[sizeof(ENC) + 1];
+    for (size_t i = 0; i < sizeof(ENC); i++) buf[i] = ENC[i] ^ 0x5a;
+    buf[sizeof(ENC)] = '\0';
+    puts(buf);
 }
 
 void vuln(void) {
